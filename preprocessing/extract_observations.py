@@ -76,7 +76,7 @@ def save_atomic(filename, obj):
   tmp_filename = filename + '.tmp'
   try:
     f = gzip.open(tmp_filename, 'wb')
-    cPickle.dump(obj, f, proto=2)
+    cPickle.dump(obj, f)
     f.flush()
     os.fsync(f.fileno())
   finally:
@@ -173,15 +173,15 @@ def valid_replay(info, ping):
   """Make sure the replay isn't corrupt, and is worth looking at."""
   if (info.HasField("error") or
       info.base_build != ping.base_build or  # different game version
-      info.game_duration_loops < 1000 or
+      # info.game_duration_loops < 1000 or
       len(info.player_info) != 2):
     # Probably corrupt, or just not interesting.
     return False
-  for p in info.player_info:
-    if p.player_apm < 10 or p.player_mmr < 1000:
-      # Low APM = player just standing around.
-      # Low MMR = corrupt replay or player who is weak.
-      return False
+  # for p in info.player_info:
+  #   if p.player_apm < 10 or p.player_mmr < 1000:
+  #     # Low APM = player just standing around.
+  #     # Low MMR = corrupt replay or player who is weak.
+  #     return False
   return True
 
 
@@ -214,37 +214,38 @@ class ReplayProcessor(multiprocessing.Process):
               self._print("Empty queue, returning")
               return
             try:
-              replay_name = os.path.basename(replay_path)[:10]
+              replay_name = os.path.basename(replay_path) # [:10]
               self.stats.replay = replay_name
               self._print("Got replay: %s" % replay_path)
               self._update_stage("open replay file")
               replay_data = self.run_config.replay_data(replay_path)
               self._update_stage("replay_info")
-              info = controller.replay_info(replay_data)
+              replay_info = controller.replay_info(replay_data)
               self._print((" Replay Info %s " % replay_name).center(60, "-"))
-              self._print(info)
+              self._print(replay_info)
               self._print("-" * 60)
-              if valid_replay(info, ping):
-                data = [info.SerializeToString()]
-                self.stats.replay_stats.maps[info.map_name] += 1
-                for player_info in info.player_info:
+              if valid_replay(replay_info, ping):
+                out = {
+                  'replay_info': replay_info.SerializeToString(),
+                }
+
+                self.stats.replay_stats.maps[replay_info.map_name] += 1
+                for player_info in replay_info.player_info:
                   race_name = sc_common.Race.Name(
                       player_info.player_info.race_actual)
                   self.stats.replay_stats.races[race_name] += 1
                 map_data = None
-                if info.local_map_path:
+                if replay_info.local_map_path:
                   self._update_stage("open map file")
-                  map_data = self.run_config.map_data(info.local_map_path)
+                  map_data = self.run_config.map_data(replay_info.local_map_path)
                 observations = []
                 for player_id in [1, 2]:
                   self._print("Starting %s from player %s's perspective" % (
                       replay_name, player_id))
-                  data.append(
-                    self.process_replay(controller, replay_data, map_data,
-                                      player_id))
+                  self.process_replay(controller, replay_data, map_data, player_id, out)
 
                 save_path = os.path.join(FLAGS.save_dir, replay_name + '.gz')
-                save_atomic(save_path, data)
+                save_atomic(save_path, out)
 
 
               else:
@@ -267,7 +268,7 @@ class ReplayProcessor(multiprocessing.Process):
     self.stats.update(stage)
     self.stats_queue.put(self.stats)
 
-  def process_replay(self, controller, replay_data, map_data, player_id):
+  def process_replay(self, controller, replay_data, map_data, player_id, out):
     """Process a single replay, updating the stats."""
     self._update_stage("start_replay")
     controller.start_replay(sc_pb.RequestStartReplay(
@@ -276,9 +277,22 @@ class ReplayProcessor(multiprocessing.Process):
         options=interface,
         observed_player_id=player_id))
 
-    feat = features.features_from_game_info(controller.game_info())
+    if 'data' not in out:
+      data = controller._client.send(data=sc_pb.RequestData(
+        ability_id=True, unit_type_id=True, upgrade_id=True, buff_id=True, effect_id=True))
+      out['data'] = data.SerializeToString()
 
-    observations_list = []
+    game_info = controller.game_info()
+    if 'game_info' not in out:
+      out['game_info'] = game_info.SerializeToString()
+
+    out['step_mul'] = FLAGS.step_mul
+
+
+    observations = []
+    out['player' + str(player_id)] = observations
+
+    feat = features.features_from_game_info(game_info)
 
     self.stats.replay_stats.replays += 1
     self._update_stage("step")
@@ -287,7 +301,7 @@ class ReplayProcessor(multiprocessing.Process):
       self.stats.replay_stats.steps += 1
       self._update_stage("observe")
       obs = controller.observe()
-      observations_list.append(obs.SerializeToString())
+      observations.append(obs.SerializeToString())
       for action in obs.actions:
         act_fl = action.action_feature_layer
         if act_fl.HasField("unit_command"):
@@ -323,7 +337,6 @@ class ReplayProcessor(multiprocessing.Process):
       self._update_stage("step")
       controller.step(FLAGS.step_mul)
 
-    return observations_list
 
 def stats_printer(stats_queue):
   """A thread that consumes stats_queue and prints them every 10 seconds."""
